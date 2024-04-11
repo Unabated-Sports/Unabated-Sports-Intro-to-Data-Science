@@ -1,0 +1,799 @@
+setwd("D:/Downloads")
+
+
+####################################
+# Get Baseball Data With baseballR #
+####################################
+
+# load library
+library(baseballr)
+
+# Get pitch-by-pitch data from statcast 
+# you can use the player search functions on baseballr to find players
+shohei <- statcast_search(
+    start_date = "2022-04-06", end_date = "2022-04-15",
+    playerid = 660271, player_type = 'batter'
+)
+
+# write the data to CSV (for upload to excel or whatever)
+write.csv(shohei, "Shohei_statcast_data.csv")
+
+
+
+# Get game-by-game logs from fangraphs 
+# this is the data we'll be using for the series
+shohei <- fg_batter_game_logs(playerid = 19755, year = 2022)
+
+# write data
+write.csv(shohei, "Shohei_Fangraphs_game_logs.csv")
+
+
+
+
+
+##########################
+# NFL Data with nflfastR #
+##########################
+
+# load library
+library(nflfastR)
+
+# get play by play data for 2019 through last year
+nfl <- load_pbp(seasons = 2019:2022)
+
+# write data
+write.csv(nfl, "NFL_play_by_play_2019_2022.csv")
+
+
+
+
+##########################
+# CFB Data with cfbfastR #
+##########################
+
+# load library
+library(cfbfastR)
+
+# get play by play data for 2022
+cfb <- cfbd_plays(year = 2022)
+
+# write data
+write.csv(cfb, "CFB_play_by_play_2022.csv")
+
+
+
+
+#########################
+# WNBA Data with wehoop #
+#########################
+
+# load library
+library(wehoop)
+
+# get WNBA play by play data
+wnba <- load_wnba_pbp(seasons = 2022)
+
+# write data
+write.csv(wnba, "WNBA_some_2022_play_by_play.csv")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+###########################################################
+### ARTICLE 2 - PROCESS / Quick EDA / CREATE FEATURE(?) ###
+###########################################################
+
+# required packages
+library(baseballr)
+library(data.table)
+library(tictoc)
+library(zoo)
+
+######################################################################
+#  The following code will pull from Fangraphs API                   #
+#  you can skip this step if you just want to load the provided csv  #
+######################################################################
+
+# get all players last 5 years first to get player ids
+all_bs <- data.table(fg_batter_leaders(2019, 2022, qual="n", ind=1))
+
+
+# get all game logs (box score info) for each player, each season:
+
+tic()  # start timer
+blogs <- data.table()  # empty data frame that we'll append every player info to
+
+# nested for loop to grab all game logs for every player in every season
+for(yr in unique(all_bs$Season)) {
+    
+    for(batter in all_bs[Season==yr]$playerid) {
+        
+        fgdat <- fg_batter_game_logs(year=yr, playerid = batter)  # get game logs
+        blogs <- rbind(blogs, fgdat, fill=T)  # attach to our big data frame
+    }
+}
+toc()  # end timer
+
+
+######################
+###   PROCESSING   ###
+######################
+
+# if you skipped step above, start here and load csv
+# blogs <- readRDS("batter_logs_for_2019_2022.rds")
+# write.csv(blogs, "batter_logs_for_2019_2022.csv", row.names = F)
+blogs <- data.table(read.csv("batter_logs_for_2019_2022.csv", check.names = FALSE))
+
+# turn csv text into a Date then sort by date (just for ease of viewing)
+blogs$Date <- as.Date(blogs$Date)
+blogs <- blogs[order(Date)]
+
+# add home and away columns
+blogs[, "away" := ifelse(grepl("@", Opp, T), Team, Opp)]
+blogs[, "home" := ifelse(grepl("@", Opp, T), Opp, Team)]
+
+# remove the @ for matching / joining later
+blogs$home <- gsub("@", "", blogs$home)
+blogs$Opp <- gsub("@", "", blogs$Opp)
+
+# create game ID - we use G in case there was a doubleheader
+blogs[, "game_id" := paste(Date, away, home, G, sep="-")]
+
+
+
+# We'll train the model on just 2021 data, so let's filter our data
+blogs <- blogs[season==2021]
+
+
+# Out modeling data frame will be one row per game, so we can model total runs in a game
+# so, we'll create data frame by game - with home team, away team, date, etc, and model vars
+# two ways to do this - do it in big table then separate out and remove dupes or 
+# separate out, remove dupes, then append stats
+# we do this b/c we're looking at game totals, so we build data 1 row per game
+
+gms <- blogs[, .(Date, home, away, G, game_id)]  # these are the columns that define our key
+gms <- gms[!duplicated(gms)]  # remove duplicates to arrive at our modeling frame
+
+
+# lets say you wanted to use current season stats, then to build a model, you need to 
+# calculate features you're interested in as they would exist in your in-use model...
+# so, you'll need to know the feature value for all games prior to every game in your train/test set
+
+
+# code to calculate avg runs scored going into each game and add to table
+Y <- blogs[, .(runs_scored = sum(R)), by=.(Date, Team)]  # calc runs scored in the game by summing across players
+Y <- Y[order(Date)]  # order DF by date
+Y <- Y[, game_num := 1:.N, by = .(Team)]  # calculate cumulative sum from game 1 to 162
+
+Y <- Y[, run_pg := cumsum(runs_scored) / (game_num - 1), by=.(Team)]  # calculate runs per game going into each game
+Y <- Y[, game_num := NULL]  # un-needed column
+
+gms <- merge(x=gms, y=Y, by.x=c("Date", "home"), by.y=c("Date", "Team"), all.x=TRUE)  # merge new home team info to our modeling data
+names(gms)[which(names(gms)=="runs_scored")] <- "home_score"  # rename for home team
+names(gms)[which(names(gms)=="run_pg")] <- "home_rpg_before"  # rename for home team
+
+gms <- merge(x=gms, y=Y, by.x=c("Date", "away"), by.y=c("Date", "Team"), all.x=TRUE)  # merge new away team info to our modeling data
+names(gms)[which(names(gms)=="runs_scored")] <- "away_score"  # rename for away team
+names(gms)[which(names(gms)=="run_pg")] <- "away_rpg_before"  # rename for away team
+
+
+# code to calculate avg runs allowed going into each game and add to table
+Y <- blogs[, .(runs_allowed = sum(R)), by=.(Date, Opp)]  # get runs scored in the game by summing OPP values across players
+names(Y)[2] <- "Team"  # rename column (or we could have switched all the var references below)
+Y <- Y[order(Date)]  # order DF by date
+Y <- Y[, game_num := 1:.N, by = .(Team)]  # calculate cumulative sum from game 1 to 162
+
+Y <- Y[, run_a_pg := cumsum(runs_allowed) / (game_num - 1), by=.(Team)]  # calculate runs allowed per game going into each game
+Y <- Y[, game_num := NULL]  # un-needed column
+Y <- Y[, runs_allowed := NULL]  # this is already in our data we're building
+
+gms <- merge(x=gms, y=Y, by.x=c("Date", "home"), by.y=c("Date", "Team"), all.x=TRUE)  # merge new home team info to our modeling data
+names(gms)[which(names(gms)=="run_a_pg")] <- "home_rapg_before"  # rename for home team
+
+gms <- merge(x=gms, y=Y, by.x=c("Date", "away"), by.y=c("Date", "Team"), all.x=TRUE)  # merge new away team info to our modeling data
+names(gms)[which(names(gms)=="run_a_pg")] <- "away_rapg_before"  # rename for away team
+
+
+
+# add team slugging percentage going into game
+Y <- blogs[, .(
+    TBs = (sum(`1B`) + 2*sum(`2B`) + 3*sum(`3B`) + 4*sum(HR)),
+    ABs = sum(AB)
+    ), 
+    by=.(Date, Team)
+]  # get SLG info for each game
+
+Y <- Y[order(Date)]  # order DF by date
+Y <- Y[, game_num := 1:.N, by = .(Team)]  # calculate cumulative sum from game 1 to 162
+
+Y <- Y[, tb_pg := cumsum(TBs) / (game_num - 1), by=.(Team)]  # calculate TB per game going into each game
+Y <- Y[, ab_pg := cumsum(ABs) / (game_num - 1), by=.(Team)]  # calculate AB per game going into each game
+Y <- Y[, slg_pct_before := tb_pg / ab_pg]
+
+Y <- Y[, .(Date, Team, slg_pct_before)]  # the only stuff we need to add to our data
+
+# attach home info
+gms <- merge(x=gms, y=Y, by.x=c("Date", "home"), by.y=c("Date", "Team"), all.x=TRUE)  # merge new home team info to our modeling data
+names(gms)[which(names(gms)=="slg_pct_before")] <- "home_slg_pct_before"
+
+gms <- merge(x=gms, y=Y, by.x=c("Date", "away"), by.y=c("Date", "Team"), all.x=TRUE)  # merge new away team info to our modeling data
+names(gms)[which(names(gms)=="slg_pct_before")] <- "away_slg_pct_before"
+
+
+
+# add strong / weak (you can do this for anything, barrells, LD%, Launch Angle, etc)
+Y <- blogs[, .(
+    Hards = sum(HardHit, na.rm = T),  # players with no ABs get NA on HardHit and BIPCount
+    BIPs = sum(bipCount, na.rm = T)
+), 
+by=.(Date, Team)
+]  # get Hard Hit rate info for each game
+
+Y <- Y[order(Date)]  # order DF by date
+Y <- Y[, game_num := 1:.N, by = .(Team)]  # calculate cumulative sum from game 1 to 162
+
+Y <- Y[, hh_pg_before := cumsum(Hards) / (game_num - 1), by=.(Team)]  # calculate HH per game going into each game
+Y <- Y[, bip_pg_before := cumsum(BIPs) / (game_num - 1), by=.(Team)]  # calculate BIP per game going into each game
+Y <- Y[, hh_pct_before := hh_pg_before / bip_pg_before]
+
+Y <- Y[, .(Date, Team, hh_pg_before, bip_pg_before, hh_pct_before)]  # the only stuff we need to add to our data
+
+# attach home info
+gms <- merge(x=gms, y=Y, by.x=c("Date", "home"), by.y=c("Date", "Team"), all.x=TRUE)  # merge new home team info to our modeling data
+names(gms)[which(names(gms)=="hh_pct_before")] <- "home_hh_pct_before"  # rename for home team
+names(gms)[which(names(gms)=="hh_pg_before")] <- "home_hh_pg_before"  # rename for home team
+names(gms)[which(names(gms)=="bip_pg_before")] <- "home_bip_pg_before"  # rename for home team
+
+
+gms <- merge(x=gms, y=Y, by.x=c("Date", "away"), by.y=c("Date", "Team"), all.x=TRUE)  # merge new away team info to our modeling data
+names(gms)[which(names(gms)=="hh_pct_before")] <- "away_hh_pct_before"  # rename for away team
+names(gms)[which(names(gms)=="hh_pg_before")] <- "away_hh_pg_before"  # rename for away team
+names(gms)[which(names(gms)=="bip_pg_before")] <- "away_bip_pg_before"  # rename for away team
+
+
+# add strong / weak last 10 games
+Y <- blogs[, .(
+    Hards = sum(HardHit, na.rm = T), # players with no ABs get NA on HardHit and BIPCount
+    BIPs = sum(bipCount, na.rm = T)
+), 
+by=.(Date, Team)
+]  # get Hard Hit rate info for each game
+
+Y <- Y[order(Date)]  # order DF by date
+
+Y <- Y[, 
+    hh_last_10 := rollapply(
+       zoo(Hards/BIPs), 
+       width=11, 
+       align="right", 
+       fill=NA, 
+       FUN = function(x) mean(x[-1])
+    ), 
+    by=.(Team)
+] # use the rollmean function to get rolling mean in previous 10 games of Hard %
+
+Y <- Y[, .(Date, Team, hh_last_10)]  # the only data we want to attach
+
+# attach home info
+gms <- merge(x=gms, y=Y, by.x=c("Date", "home"), by.y=c("Date", "Team"), all.x=TRUE)  # merge new home team info to our modeling data
+names(gms)[which(names(gms)=="hh_last_10")] <- "home_hh_last_10"  # rename for home team
+
+gms <- merge(x=gms, y=Y, by.x=c("Date", "away"), by.y=c("Date", "Team"), all.x=TRUE)  # merge new away team info to our modeling data
+names(gms)[which(names(gms)=="hh_last_10")] <- "away_hh_last_10"  # rename for away team
+
+# ensure the vars created are numeric
+gms$home_hh_last_10 <- as.numeric(gms$home_hh_last_10)  # make sure these are numeric
+gms$away_hh_last_10 <- as.numeric(gms$away_hh_last_10)  # make sure these are numeric
+
+
+# Correlations and data exploration
+library(DataExplorer)
+
+# remove stuff with NA's etc
+dat <- gms[complete.cases(gms)]
+
+# rename things for a pretty chart
+names(dat)[6:21] <- c(
+    "Home Score", "Home Runs Scored PG", "Away Score", "Away Runs Scored PG",
+    "Home RA PG", "Away RA PG", "Home SLG", "Away SLG", "Home Hard Hit PG", 
+    "Home BIP PG", "Home HH Rate", "Away Hard Hit PG", "Away BIP PG", "Away HH Rate",
+    "Home HH Last 10", "Away HH Last 10"
+)
+
+plot_correlation(dat)
+
+# see this blog post to do some other very quick reports
+# https://www.r-bloggers.com/2021/03/super-fast-eda-in-r-with-dataexplorer/
+# saveRDS(dat, "data_after_article_2.rds")
+# write.csv(dat, "data_after_article_2.csv", row.names=F)
+
+
+
+
+
+
+
+##########################
+### ARTICLE 4 ############
+##########################
+
+require(data.table)
+require(zoo)
+require(baseballr)
+
+# load data from article 2
+dat <- readRDS("data_after_article_2.rds")
+dat <- data.table(read.csv("data_after_article_2.csv"))
+
+
+####################
+# attach odds data #
+####################
+
+# instantiate odds data frame
+odds <- data.table()
+
+# Load and attach odds data 2019
+od1 <- data.table(read.csv("mlb2019_odds.csv"))  # read odds file
+od1 <- od1[, .(Date, VH, Team, Close, Run.Line, X, Close.OU, X.2)]  # collect and rename cols
+names(od1) <- c(
+    "date", "home", "team", "ml_price", "run_line", "rl_price", "tot", "tot_price"
+)
+
+od1 <- od1[home != "N"]  #  remove neutral sites
+od1 <- od1[home == "V", home := "A"]  # change V to A for "Away" designation
+od1$ou <- od1$home  # in this data, Away team always listed with Over prices
+od1 <- od1[ou == "A", ou := "O"]  # Assign overs
+od1 <- od1[ou == "H", ou := "U"]  # assign unders
+od1$season <- 2019
+
+# bind/stack 2019 odds to odds data frame
+odds <- rbind(odds, od1)
+
+
+# Load and attach odds data 2020
+od2 <- data.table(read.csv("mlb2020_odds.csv"))  # read odds file
+od2 <- od2[, .(Date, VH, Team, Close, RunLine, X, CloseOU, X.2)]  # different than above
+names(od2) <- c(
+    "date", "home", "team", "ml_price", "run_line", "rl_price", "tot", "tot_price"
+)
+
+od2 <- od2[home != "N"]  #  remove neutral sites
+od2 <- od2[home == "V", home := "A"]
+od2$ou <- od2$home
+od2 <- od2[ou == "A", ou := "O"]
+od2 <- od2[ou == "H", ou := "U"]
+od2$season <- 2020
+
+# bind/stack 2020 odds to odds data frame
+odds <- rbind(odds, od2)
+
+
+# Load and attach odds data 2021
+od3 <- data.table(read.csv("mlb2021_odds.csv"))  # read 2021 odds
+od3 <- od3[, .(Date, VH, Team, Close, RunLine, X, CloseOU, X.2)]  # different than above
+names(od3) <- c(
+    "date", "home", "team", "ml_price", "run_line", "rl_price", "tot", "tot_price"
+)
+
+od3 <- od3[home != "N"]
+od3 <- od3[home == "V", home := "A"]
+od3$ou <- od3$home
+od3 <- od3[ou == "A", ou := "O"]
+od3 <- od3[ou == "H", ou := "U"]
+od3$season <- 2021
+
+# bind/stack 2021 odds to odds data frame
+odds <- rbind(odds, od3)
+
+# extract odds function
+# this function is written to retrieve the date from odds data in the correct format
+# odds data is in form of 401 for April 1
+# you could do this in one line by attaching season first then using: as.Date(, format = '%m%d%y')
+extract_odds_date <- function(seas, dat_str) {
+    
+    if (nchar(dat_str) == 4) {
+        odate <- paste0(
+            seas, "-",
+            substr(as.character(dat_str), 1, 2), "-",
+            substr(as.character(dat_str), 3, 4)
+        )
+    } else {
+        odate <- paste0(
+            seas, "-",
+            substr(as.character(dat_str), 1, 1), "-",
+            substr(as.character(dat_str), 2, 3)
+        )
+    }
+    
+    return(odate)
+    
+}
+
+# process date using function above
+odds[, "new_date" := extract_odds_date(season, date), by=.(date, season, team)]
+odds$date <- as.Date(odds$new_date)
+odds[, "new_date" := NULL]
+names(odds)[1] <- "Date"
+
+# change team names
+# odds data ABBVs do not match FG Data.
+odds[team=="BRS", team:="BOS"]
+odds[team=="CUB", team:="CHC"]
+odds[team=="CWS", team:="CHW"]
+odds[team=="KAN", team:="KCR"]
+odds[team=="SDG", team:="SDP"]
+odds[team=="SFO", team:="SFG"]
+odds[team=="TAM", team:="TBR"]
+odds[team=="WAS", team:="WSN"]
+
+
+# Attach odds to FG data
+# We're only using 2021 data for analysis right now, similar process to use all data
+# attach 2021 Moneylines 
+Y <- odds[, .(Date, team, ml_price)]  # create data frame to attach
+Y <- Y[!duplicated(Y[ , .(Date, team)])]  # the odds data has double headers, our data only has first games, so remove the 2nd game lines
+
+# attach away ML's
+names(Y) <- c("Date", "away", "a_ml")
+dat <- merge(x=dat, y=Y, by=c("Date", "away"), all.x=T)
+
+# home ML's
+names(Y) <- c("Date", "home", "h_ml")
+dat <- merge(x=dat, y=Y, by=c("Date", "home"), all.x=T)
+
+
+# attach totals
+Y <- odds[, .(Date, team, tot)]
+Y <- Y[!duplicated(Y[ , .(Date, team)])] # the odds data has double headers, our data only has first games, so remove the 2nd game lines
+
+names(Y) <- c("Date", "away", "total")
+dat <- merge(x=dat, y=Y, by=c("Date", "away"), all.x=T)
+
+# attach total prices
+Y <- odds[, .(Date, team, tot_price)]
+Y <- Y[!duplicated(Y[ , .(Date, team)])] # the odds data has double headers, our data only has first games, so remove the 2nd game lines
+
+# over prices
+names(Y) <- c("Date", "away", "o_price")
+dat <- merge(x=dat, y=Y, by=c("Date", "away"), all.x=T)
+
+# under prices
+names(Y) <- c("Date", "home", "u_price")
+dat <- merge(x=dat, y=Y, by=c("Date", "home"), all.x=T)
+
+# clean data (removing rows with missing odds info)
+dat <- dat[!is.na(h_ml)]
+dat <- dat[!is.na(a_ml)]
+dat <- dat[!is.na(o_price)]
+dat <- dat[!is.na(u_price)]
+dat <- dat[!is.na(total)]
+
+
+#################################################
+# calculate odds info (probs / covers / no-vig) #
+#################################################
+
+# we'll define 3 functions for processing american odds
+# the first function converts american odds to implied probability
+conv_odds_to_prob <- function(odds_amer) {
+    if (odds_amer >=0) {
+        out = (100 / (odds_amer + 100))
+    } else {
+        out = (-odds_amer / (-odds_amer + 100))
+    }
+    
+    return(out)
+}
+
+# function to convert probabilities to american odds
+conv_prob_to_odds <- function(prob) {
+    if (prob <= 0.5) {
+        out = 100 * (1/prob - 1)
+    } else {
+        out = -100 / (1/prob - 1)
+    }
+    
+    return(round(out,0))
+    
+}
+
+# function to remove vig from two implied with-vig probabiliites
+remove_vig <- function(p1, p2, ret_p1_or_p2 = "p1") {
+    
+    out1 <- p1/(p1+p2)
+    out2 <- p2/(p1+p2)
+    
+    if(ret_p1_or_p2 == "p1") {return(out1)} else {return(out2)}
+}
+
+
+# Add more implied probabilities
+dat[, h_imp_prob := sapply(h_ml, conv_odds_to_prob)]
+dat[, a_imp_prob := sapply(a_ml, conv_odds_to_prob)]
+
+dat[, h_nv_prob := mapply(remove_vig, h_imp_prob, a_imp_prob, "p1")]
+dat[, a_nv_prob := mapply(remove_vig, h_imp_prob, a_imp_prob, "p2")]
+
+dat[, o_imp_prob := sapply(o_price, conv_odds_to_prob)]
+dat[, u_imp_prob := sapply(u_price, conv_odds_to_prob)]
+
+dat[, o_nv_prob := mapply(remove_vig, o_imp_prob, u_imp_prob, "p1")]
+dat[, u_nv_prob := mapply(remove_vig, o_imp_prob, u_imp_prob, "p2")]
+
+
+# add binary vars if things covered
+dat[, h_cover := as.integer(home_score > away_score)]  # did the home team cover?
+dat[, actual_total := home_score + away_score]  # calc game total
+dat[, tot_over := as.integer(actual_total > total)]  # did game total go over vegas total?
+
+
+################################
+# attach starting pitcher data #
+################################
+
+# Like we did in original article with batters, let's grab SP data to attach
+# you can also skip ahead 20 lines or so if you don't want to wait 15 min
+
+# get all players last 5 years first to get player ids
+# all_ps <- data.table(fg_pitcher_leaders(2019, 2022, qual="n", ind=1))
+
+# package change necessitates the change instead of above
+all_ps <- data.table()
+for(YR in 2019:2022) {
+    tmp <- data.table(fg_pitcher_leaders(
+        startseason = YR, endseason = YR, qual="n", ind=1)
+    )
+    
+    all_ps <- rbind(all_ps, tmp, fill=T)
+}
+
+
+# get all game logs (box score info) for each player, each game, in each season:
+tic()  # start timer (will take about 15 min)
+
+plogs <- data.table()  # empty data frame that we'll append every player info to
+
+# nested for loop to grab all game logs for every player in every season
+for(yr in unique(all_ps$Season)) {
+    
+    for(ptchr in all_ps[Season==yr]$playerid) {
+        
+        fgdat <- fg_pitcher_game_logs(year=yr, playerid = ptchr)  # get game logs from FG
+        plogs <- rbind(plogs, fgdat, fill=T)  # attach to our big data frame
+    }
+}
+toc()  # end timer
+
+# if you want to skip waiting, just load this data
+# plogs <- readRDS("pitcher_logs.rds")  # skip above and just load data
+# plogs <- data.table(read.csv("pitcher_game_logs_FG_2019_2022.csv")  # skip above and just load data
+plogs <- data.table(plogs)  # make a data table
+
+# change date 
+plogs$Date <- as.Date(plogs$Date)
+plogs <- plogs[order(Date)]
+
+# add home and away columns
+plogs[, "away" := ifelse(grepl("@", Opp, T), Team, Opp)]
+plogs[, "home" := ifelse(grepl("@", Opp, T), Opp, Team)]
+
+# remove the @ for matching / joining later
+plogs$home <- gsub("@", "", plogs$home)
+plogs$Opp <- gsub("@", "", plogs$Opp)
+
+# add game id
+plogs[, "game_id" := paste(Date, away, home, 1, sep="-")]
+
+# there are some games where the data lists two starters (due to double header)
+# this issue also affects the original data set, so we'll just remove all double header games
+dbh <- plogs[, sum(GS), by=.(game_id)]  # count number of starters for each game_id
+names(dbh)[2] <- "num_of_starters"
+games_to_remove <- unique(dbh[num_of_starters==4]$game_id)  # games with 4 starters are double headers
+
+dat <- dat[! (game_id %in% games_to_remove)]  # remove dbh from our modeling data
+plogs <- plogs[! (game_id %in% games_to_remove)]  # remove dbh from pitcher data
+
+
+# add away starters player_id
+astrts <- plogs[GS == 1 & Team == away, .(game_id, playerid)]  # all away starters
+names(astrts) <- c("game_id", "away_sp_id")
+dat <- merge(x=dat, y=astrts, by="game_id", all.x=T)
+
+# add home starters
+hstrts <- plogs[GS == 1 & Team == home, .(game_id, playerid)]  # all home starters
+names(hstrts) <- c("game_id", "home_sp_id")
+dat <- merge(x=dat, y=hstrts, by="game_id", all.x=T)
+
+
+# add starters avg hh rate
+plogs <- plogs[season == 2021]  # use only 2021 stats, since we're using 2021
+
+Y <- plogs[, .(
+    Hards = sum(HardHit, na.rm = T),  # players with no ABs get NA on HardHit and BIPCount
+    BIPs = sum(bipCount, na.rm = T)
+), 
+by=.(Date, playerid)
+]  # get Hard Hit rate info for each game
+
+Y <- Y[order(Date)]  # order DF by date
+Y <- Y[, game_num := 1:.N, by = .(playerid)]  # calculate cumulative sum for games appeared in
+
+Y <- Y[, hh_pg_before := cumsum(Hards) / (game_num - 1), by=.(playerid)]  # calculate HH per game going into each game
+Y <- Y[, bip_pg_before := cumsum(BIPs) / (game_num - 1), by=.(playerid)]  # calculate BIP per game going into each game
+Y <- Y[, hh_pct_before := hh_pg_before / bip_pg_before]
+
+Y <- Y[, .(Date, playerid, hh_pct_before)]  # the only stuff we need to add to our data
+
+# attach away info
+dat <- merge(x=dat, y=Y, by.x=c("Date", "away_sp_id"), by.y=c("Date", "playerid"), all.x=TRUE)  # merge away pitcher info
+names(dat)[which(names(dat)=="hh_pct_before")] <- "away_sp_hh_pct_before"  # rename for home team
+
+# attach home info
+dat <- merge(x=dat, y=Y, by.x=c("Date", "home_sp_id"), by.y=c("Date", "playerid"), all.x=TRUE)  # merge new away team info to our modeling data
+names(dat)[which(names(dat)=="hh_pct_before")] <- "home_sp_hh_pct_before"  # rename for away team
+
+
+# add  hard hit info for SPs in last 3 appearances
+Y <- plogs[, .(
+    Hards = sum(HardHit, na.rm = T), # players with no ABs get NA on HardHit and BIPCount
+    BIPs = sum(bipCount, na.rm = T)
+), 
+by=.(Date, playerid)
+]  # get Hard Hit rate info for each game
+
+Y <- Y[order(Date)]  # order DF by date
+
+Y <- Y[, 
+       hh_last_3 := rollapply(
+           zoo(Hards/BIPs), 
+           width=4, 
+           align="right", 
+           fill=NA, 
+           FUN = function(x) mean(x[-1])
+       ), 
+       by=.(playerid)
+] # use the rollmean function to get rolling mean in previous 5 games of Hard %
+
+Y <- Y[, .(Date, playerid, hh_last_3)]  # the only data we want to attach
+
+# attach away info
+dat <- merge(x=dat, y=Y, by.x=c("Date", "away_sp_id"), by.y=c("Date", "playerid"), all.x=TRUE)  # merge new home team info to our modeling data
+names(dat)[which(names(dat)=="hh_last_3")] <- "away_sp_hh_last_3"  # rename for home team
+
+# attach home info
+dat <- merge(x=dat, y=Y, by.x=c("Date", "home_sp_id"), by.y=c("Date", "playerid"), all.x=TRUE)  # merge new away team info to our modeling data
+names(dat)[which(names(dat)=="hh_last_3")] <- "home_sp_hh_last_3"  # rename for away team
+
+# ensure the vars created are numeric
+dat$home_sp_hh_last_3 <- as.numeric(dat$home_sp_hh_last_3)  # make sure these are numeric
+dat$away_sp_hh_last_3 <- as.numeric(dat$away_sp_hh_last_3)  # make sure these are numeric
+
+
+# final data clean up
+dat <- dat[complete.cases(dat)]  # remove stuff with NA's etc
+
+
+#################################################
+# check correlations with odds info and new var #
+#################################################
+library(DataExplorer)
+
+# only cols you need
+gf <- dat[, 8:43]
+
+# rename things for a pretty chart
+names(gf) <- c(
+    "Home Score", "Home Runs Scored PG", "Away Score", "Away Runs Scored PG",
+    "Home RA PG", "Away RA PG", "Home SLG", "Away SLG", "Home Hard Hit PG",
+    "Home BIP PG", "Home HH Rate", "Away Hard Hit PG", "Away BIP PG", "Away HH Rate",
+    "Home HH Last 10", "Away HH Last 10", "Away ML", "Home ML", "Total", "Ov Price",
+    "Un Price", "H Imp Prob", "A Imp Prob", "H NV Prob", "A NV Prob", "Ov Imp Prob",
+    "Un Imp Prob", "Ov NV Prob", "Un NV Prob", "Home Cover", "Actual Total", 
+    "Total Over", "A SP HH Pct", "H SP HH Pct", "A SP HH Last 3", "H SP HH Last 3"
+)
+
+plot_correlation(gf)
+
+
+
+
+
+
+
+
+
+    #################
+    ### ARTICLE 5 ###
+    #################
+    
+    # load data from after article 4.
+    dat <- data.table(read.csv("data_after_article_4.csv"))
+
+    # Build models with the variables we created
+    
+    # simple linear regression using hh stuff and rapg
+    
+        # Let's predict home score using both home hh pg and away rpg
+        fit1 <- lm(data = dat, home_score ~ home_hh_pg_before + away_rapg_before)
+        
+        # this command will show you info about the model, including the coefficients
+        summary(fit1)
+        
+        # add predictions back to the data set for analysis later
+        dat$home_score_pred1 <- predict(fit1, data=dat)
+    
+        
+        # Now let's say we believe teams can be on "hot" or "cold" streaks
+        # We can add in the last_10 vars we created. 
+        # WE DIDNT CREATE A RAPG_LAST_10 var
+        fit2 <- lm(
+            data = dat, 
+            home_score ~ home_hh_pg_before + home_hh_last_10 + away_rapg_before
+        )
+        
+        # look at summary of model
+        summary(fit2)
+        
+        # add predictions back to the data set
+        dat$home_score_pred2 <- predict(fit2, data=dat)
+        
+        
+        # Now we'll do the same for away team (no comments this time)
+        fit1 <- lm(data = dat, away_score ~ away_hh_pg_before + home_rapg_before)
+        summary(fit1)
+        dat$away_score_pred1 <- predict(fit1, data=dat)
+        
+        fit2 <- lm(
+            data = dat, 
+            away_score ~ away_hh_pg_before + away_hh_last_10 + home_rapg_before
+        )
+        
+        summary(fit2)
+        dat$away_score_pred2 <- predict(fit2, data=dat)
+        
+        
+        
+        # Now we'll do some regressions on the game total
+        fit3 <- lm(
+            data = dat, 
+            actual_total ~ home_hh_pg_before + away_hh_pg_before + home_hh_last_10 + away_hh_last_10 + home_rapg_before + away_rapg_before
+        )
+        
+        summary(fit3)
+        dat$total_pred <- predict(fit3, data=dat)
+        
+        
+    # Now we can do some Logistic regression on whether the total went over
+    # this is a binary outcome, the Logistic regression will allow us to predict 
+    # a probability that the game goes over the total
+    
+        # build logistic model on whether the total was over
+        # we'll just a few vars that come up as significant
+        fit4 <- glm(
+            data = dat,
+            family = "binomial",
+            tot_over ~ home_hh_last_10 + home_rapg_before + away_rapg_before
+        )
+        
+        summary(fit4)
+        dat$over_prob_pred <- predict(fit4, data=dat, type="response")
+        
+        
+    # Now we can convert these probs back to odds to compare to no-vig market
+    dat[, o_nv_odds := sapply(o_nv_prob, conv_prob_to_odds)]
+    dat[, o_pred_odds := sapply(over_prob_pred, conv_prob_to_odds)]
+    
+    
+    
+    # Ok we've got some models built, in the next article, we'll assess how well they perform.
