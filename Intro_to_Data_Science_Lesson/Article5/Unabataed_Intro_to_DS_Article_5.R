@@ -1,3 +1,14 @@
+
+# load packages
+require(data.table)
+require(ggplot2)
+
+
+
+
+
+
+
 #################
 ### ARTICLE 5 ###
 #################
@@ -18,6 +29,17 @@ summary(fit1)
 # add predictions back to the data set for analysis later
 dat$home_score_pred1 <- predict(fit1, data=dat)
 
+# plot qq plot
+plot(fit1, which=2)
+
+# plot density of residuals
+ggplot(dat, aes(x=home_score_pred1 - home_score)) + 
+    geom_density() +
+    xlab("Model Error") + 
+    ylab("Density") +
+    ggtitle("Distribution of Residuals") +
+    theme_bw()
+
 
 # Now let's say we believe teams can be on "hot" or "cold" streaks
 # We can add in the last_10 vars we created. 
@@ -29,7 +51,6 @@ fit2 <- lm(
 
 # look at summary of model
 summary(fit2)
-
 
 # add predictions back to the data set
 dat$home_score_pred2 <- predict(fit2, data=dat)
@@ -79,12 +100,5 @@ dat$over_prob_pred <- predict(fit4, data=dat, type="response")
 # Now we can convert these probs back to odds to compare to no-vig market
 dat[, o_nv_odds := sapply(o_nv_prob, conv_prob_to_odds)]
 dat[, o_pred_odds := sapply(over_prob_pred, conv_prob_to_odds)]
-
-
-
-# 
-
-
-
 
 # Ok we've got some models built, in the next article, we'll assess how well they perform.
