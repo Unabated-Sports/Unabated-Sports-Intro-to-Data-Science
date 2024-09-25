@@ -11,8 +11,8 @@ prob_to_american_odds <- function(prob) {
 
 monte_carlo_best_of_7 <- function() {
   # Prompts for user input
-  favorite <- readline(prompt = "Enter the series favorite team: ")
-  underdog <- readline(prompt = "Enter the series underdog team: ")
+  favorite <- readline(prompt = "Enter the team with home-field advantage: ")
+  underdog <- readline(prompt = "Enter the opponent: ")
   favorite_home_prob <- as.numeric(readline(prompt = paste0("Enter ", favorite, "'s home win probability as a decimal: ")))
   underdog_home_prob <- as.numeric(readline(prompt = paste0("Enter ", underdog, "'s home win probability as a decimal: ")))
   favorite_wins <- as.integer(readline(prompt = paste0("Enter the number of games ", favorite, " has won to date: ")))
